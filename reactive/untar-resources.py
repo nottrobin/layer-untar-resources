@@ -5,9 +5,14 @@ import pwd
 import shutil
 import subprocess
 import tarfile
+from hashlib import md5
 
 # Third-party packages
-from charmhelpers.core.hookenv import log, resource_get, status_set
+from charmhelpers.core.hookenv import (
+    log,
+    resource_get,
+    status_set
+)
 from charms.reactive import hook, set_state
 import yaml
 
@@ -48,6 +53,10 @@ def _chown_recursive(path, username, groupname):
     os.chown(path, user_id, group_id)
 
 
+def _log(message):
+    log('[untar-resources] {message}'.format(**locals()))
+
+
 @hook('config-changed')
 def update():
     resources_config = layer_config['resources']
@@ -72,60 +81,58 @@ def update():
 
         target_path = destination_path.rstrip('/')
         next_path = destination_path + '.next'
+        hash_path = destination_path + '.hash'
         previous_path = destination_path + '.previous'
 
-        # Stop if the archive is older than the currently deployed version
-        if os.path.exists(target_path):
-            current_mtime = os.path.getmtime(target_path)
-            archive_mtime = os.path.getmtime(resource_path)
+        _log('Reading hash of {resource_path}'.format(**locals()))
+        resource_hash = md5()
+        with open(resource_path, "rb") as resource:
+            # Load file half a MP at a time
+            for chunk in iter(lambda: resource.read(524288), b""):
+                resource_hash.update(chunk)
+        resource_hex = resource_hash.hexdigest()
 
-            if current_mtime > archive_mtime:
-                log(
-                    '[untar-resources] Already at most recent version. '
-                    'Stopping'
-                )
+        existing_hex = None
+        if os.path.exists(hash_path):
+            with open(hash_path) as hash_file:
+                existing_hex = hash_file.read()
 
-                set_state('resources.{}.available'.format(resource_name))
+        if resource_hex == existing_hex:
+            _log((
+                '{resource_name} hash {resource_hex} already extracted'
+            ).format(**locals()))
 
-                return
+            set_state('resources.{}.available'.format(resource_name))
 
-        log(
-            '[untar-resources] Creating {next_path}'.format(
-                **locals()
-            )
-        )
+            return
+        else:
+            _log((
+                'Extracting {resource_name} with hash: {resource_hex}'
+            ).format(**locals()))
+
+        _log('Creating {next_path}'.format(**locals()))
         os.makedirs(next_path, exist_ok=True)
 
-        log(
-            (
-                '[untar-resources] Extracting '
-                '{resource_path} into {next_path}'
-            ).format(**locals())
-        )
+        _log('Extracting {resource_path} into {next_path}'.format(**locals()))
         tar = tarfile.open(resource_path)
         tar.extractall(next_path)
         tar.close()
 
-        log('[untar-resources] Setting ownership to {} '.format(username))
+        _log('Setting ownership to {username}'.format(**locals()))
         _chown_recursive(next_path, username, username)
 
         # Remove previous version
         if os.path.isdir(previous_path):
-            log(
-                (
-                    '[untar-resources] Removing previous version from'
-                    '{previous_path}'
-                ).format(**locals())
-            )
+            _log('Removing previous version from {previous_path}'.format(
+                **locals()
+            ))
             shutil.rmtree(previous_path)
 
-        log(
-            (
-                '[untar-resources] Installing new version: Moving '
-                '{next_path} -> {target_path} and '
-                '{target_path} -> {previous_path}'
-            ).format(**locals())
-        )
+        _log((
+                'Installing new version: Moving {next_path} -> {target_path} '
+                'and {target_path} -> {previous_path}'
+        ).format(**locals()))
+
         subprocess.check_call(
             [
                 "mv",
@@ -134,5 +141,9 @@ def update():
                 target_path
             ]
         )
+
+        _log('Setting {hash_path} to {resource_hex}'.format(**locals()))
+        with open(hash_path, 'w') as hash_file:
+            hash_file.write(resource_hex)
 
         set_state('resources.{}.available'.format(resource_name))
